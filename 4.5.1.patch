@@ -1,0 +1,441 @@
+diff --git a/src/main/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorInputStream.java b/src/main/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorInputStream.java
+new file mode 100644
+index 000000000..2d28c1449
+--- /dev/null
++++ b/src/main/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorInputStream.java
+@@ -0,0 +1,165 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.commons.compress.compressors.lz77;
++
++import java.io.IOException;
++import java.io.InputStream;
++
++import org.apache.commons.compress.compressors.CompressorException;
++import org.apache.commons.compress.compressors.lz77support.AbstractLZ77CompressorInputStream;
++import org.apache.commons.compress.utils.ByteUtils;
++import org.apache.commons.io.IOUtils;
++
++/**
++ * CompressorInputStream for raw LZ77 streams without container format.
++ * <p>
++ * This class implements a simple LZ77 decompression algorithm that works on raw streams
++ * without additional headers or footers. The stream format is as follows:
++ * </p>
++ * <ul>
++ *   <li>Each element starts with a type indicator byte (0 for literal, 1 for back reference)</li>
++ *   <li>For literals: followed by a 4-byte little-endian length, then the literal bytes</li>
++ *   <li>For back references: followed by 4-byte little-endian offset, then 4-byte little-endian length</li>
++ * </ul>
++ * <p>
++ * The stream ends with a type indicator byte of 0xFF.
++ * </p>
++ *
++ * @since 1.28.0
++ * @NotThreadSafe
++ */
++public class LZ77CompressorInputStream extends AbstractLZ77CompressorInputStream {
++
++    private enum State {
++        NO_BLOCK,
++        IN_LITERAL,
++        IN_BACK_REFERENCE,
++        EOF
++    }
++
++    private static final int TYPE_LITERAL = 0;
++    private static final int TYPE_BACK_REFERENCE = 1;
++    private static final int TYPE_EOF = 0xFF;
++
++    static final int DEFAULT_WINDOW_SIZE = 1 << 16;
++
++    private State state = State.NO_BLOCK;
++
++    /**
++     * Creates a new LZ77 input stream with default window size.
++     *
++     * @param is An InputStream to read compressed data from.
++     */
++    public LZ77CompressorInputStream(final InputStream is) {
++        this(is, DEFAULT_WINDOW_SIZE);
++    }
++
++    /**
++     * Creates a new LZ77 input stream with specified window size.
++     *
++     * @param is An InputStream to read compressed data from.
++     * @param windowSize Size of the window kept for back-references.
++     */
++    public LZ77CompressorInputStream(final InputStream is, final int windowSize) {
++        super(is, windowSize);
++    }
++
++    private void readNextBlock() throws IOException {
++        final int type = readOneByte();
++        if (type == -1) {
++            state = State.EOF;
++            return;
++        }
++
++        switch (type) {
++            case TYPE_LITERAL:
++                readLiteralBlock();
++                break;
++            case TYPE_BACK_REFERENCE:
++                readBackReferenceBlock();
++                break;
++            case TYPE_EOF:
++                state = State.EOF;
++                break;
++            default:
++                throw new CompressorException("Invalid block type: " + type);
++        }
++    }
++
++    private void readLiteralBlock() throws IOException {
++        final long length = ByteUtils.fromLittleEndian(supplier, 4);
++        if (length < 0) {
++            throw new CompressorException("Invalid literal length: " + length);
++        }
++        startLiteral(length);
++        state = State.IN_LITERAL;
++    }
++
++    private void readBackReferenceBlock() throws IOException {
++        final int offset = (int) ByteUtils.fromLittleEndian(supplier, 4);
++        final long length = ByteUtils.fromLittleEndian(supplier, 4);
++        if (offset <= 0) {
++            throw new CompressorException("Invalid back reference offset: " + offset);
++        }
++        if (length < 0) {
++            throw new CompressorException("Invalid back reference length: " + length);
++        }
++        startBackReference(offset, length);
++        state = State.IN_BACK_REFERENCE;
++    }
++
++    @Override
++    public int read(final byte[] b, final int off, final int len) throws IOException {
++        IOUtils.checkFromIndexSize(b, off, len);
++        if (len == 0) {
++            return 0;
++        }
++
++        while (true) {
++            switch (state) {
++                case EOF:
++                    return -1;
++                case NO_BLOCK:
++                    readNextBlock();
++                    if (state == State.EOF) {
++                        return -1;
++                    }
++                    break;
++                case IN_LITERAL:
++                    final int litLen = readLiteral(b, off, len);
++                    if (!hasMoreDataInBlock()) {
++                        state = State.NO_BLOCK;
++                    }
++                    if (litLen > 0) {
++                        return litLen;
++                    }
++                    break;
++                case IN_BACK_REFERENCE:
++                    final int refLen = readBackReference(b, off, len);
++                    if (!hasMoreDataInBlock()) {
++                        state = State.NO_BLOCK;
++                    }
++                    if (refLen > 0) {
++                        return refLen;
++                    }
++                    break;
++            }
++        }
++    }
++}
+diff --git a/src/main/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorOutputStream.java b/src/main/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorOutputStream.java
+new file mode 100644
+index 000000000..8a86da2c9
+--- /dev/null
++++ b/src/main/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorOutputStream.java
+@@ -0,0 +1,139 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.commons.compress.compressors.lz77;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.commons.compress.compressors.CompressorOutputStream;
++import org.apache.commons.compress.compressors.lz77support.LZ77Compressor;
++import org.apache.commons.compress.compressors.lz77support.Parameters;
++import org.apache.commons.compress.utils.ByteUtils;
++
++/**
++ * CompressorOutputStream for raw LZ77 streams without container format.
++ * <p>
++ * This class provides a basic LZ77 compression implementation that produces streams
++ * compatible with {@link LZ77CompressorInputStream}.
++ * </p>
++ *
++ * @see LZ77CompressorInputStream
++ * @since 1.28.0
++ * @NotThreadSafe
++ */
++public class LZ77CompressorOutputStream extends CompressorOutputStream<OutputStream> {
++
++    private static final int TYPE_LITERAL = 0;
++    private static final int TYPE_BACK_REFERENCE = 1;
++    private static final int TYPE_EOF = 0xFF;
++
++    private final LZ77Compressor compressor;
++    private final List<LZ77Compressor.Block> blocks = new ArrayList<>();
++    private boolean finished = false;
++
++    /**
++     * Creates a new LZ77 output stream with default parameters.
++     *
++     * @param out The output stream to write compressed data to.
++     */
++    public LZ77CompressorOutputStream(final OutputStream out) {
++        this(out, Parameters.builder().withWindowSize(LZ77CompressorInputStream.DEFAULT_WINDOW_SIZE).build());
++    }
++
++    /**
++     * Creates a new LZ77 output stream with specified parameters.
++     *
++     * @param out The output stream to write compressed data to.
++     * @param params The LZ77 compression parameters.
++     */
++    public LZ77CompressorOutputStream(final OutputStream out, final Parameters params) {
++        super(out);
++        this.compressor = new LZ77Compressor(params, blocks::add);
++    }
++
++    @Override
++    public void write(final int b) throws IOException {
++        write(new byte[] { (byte) b }, 0, 1);
++    }
++
++    @Override
++    public void write(final byte[] b, final int off, final int len) throws IOException {
++        if (finished) {
++            throw new IOException("Stream already finished");
++        }
++        compressor.compress(b, off, len);
++    }
++
++    @Override
++    public void finish() throws IOException {
++        if (!finished) {
++            compressor.finish();
++            finished = true;
++            writeBlocks();
++        }
++    }
++
++    private void writeBlocks() throws IOException {
++        for (final LZ77Compressor.Block block : blocks) {
++            switch (block.getType()) {
++                case LITERAL:
++                    writeLiteral((LZ77Compressor.LiteralBlock) block);
++                    break;
++                case BACK_REFERENCE:
++                    writeBackReference((LZ77Compressor.BackReference) block);
++                    break;
++                case EOD:
++                    out.write(TYPE_EOF);
++                    break;
++            }
++        }
++    }
++
++    private void writeLiteral(final LZ77Compressor.LiteralBlock block) throws IOException {
++        out.write(TYPE_LITERAL);
++        final int length = block.getLength();
++        writeInt(length);
++        out.write(block.getData(), block.getOffset(), length);
++    }
++
++    private void writeBackReference(final LZ77Compressor.BackReference block) throws IOException {
++        out.write(TYPE_BACK_REFERENCE);
++        writeInt(block.getOffset());
++        writeInt(block.getLength());
++    }
++
++    private void writeInt(final int value) throws IOException {
++        final byte[] buf = new byte[4];
++        ByteUtils.toLittleEndian(buf, value, 0, 4);
++        out.write(buf);
++    }
++
++    @Override
++    public void close() throws IOException {
++        try {
++            if (!finished) {
++                finish();
++            }
++        } finally {
++            out.close();
++        }
++    }
++}
+diff --git a/src/main/java/org/apache/commons/compress/compressors/lz77/package-info.java b/src/main/java/org/apache/commons/compress/compressors/lz77/package-info.java
+new file mode 100644
+index 000000000..efaded7b4
+--- /dev/null
++++ b/src/main/java/org/apache/commons/compress/compressors/lz77/package-info.java
+@@ -0,0 +1,27 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++/**
++ * Provides stream classes for the raw LZ77 algorithm without container format.
++ * <p>
++ * This package provides a basic implementation of the LZ77 algorithm that works on raw streams
++ * without any additional container format like headers, checksums or footers.
++ * </p>
++ */
++package org.apache.commons.compress.compressors.lz77;
+diff --git a/src/test/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorInputStreamTest.java b/src/test/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorInputStreamTest.java
+new file mode 100644
+index 000000000..2403400b3
+--- /dev/null
++++ b/src/test/java/org/apache/commons/compress/compressors/lz77/LZ77CompressorInputStreamTest.java
+@@ -0,0 +1,86 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.commons.compress.compressors.lz77;
++
++import static org.junit.jupiter.api.Assertions.assertArrayEquals;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++import org.apache.commons.io.IOUtils;
++import org.junit.jupiter.api.Test;
++
++/**
++ * Tests for {@link LZ77CompressorInputStream}.
++ */
++class LZ77CompressorInputStreamTest {
++
++    @Test
++    void testAbcAbc() throws IOException {
++        final byte[] original = "abcabc".getBytes();
++        final byte[] compressed = compress(original);
++        final byte[] decompressed = decompress(compressed);
++        assertArrayEquals(original, decompressed);
++    }
++
++    @Test
++    void testEmptyString() throws IOException {
++        final byte[] original = new byte[0];
++        final byte[] compressed = compress(original);
++        final byte[] decompressed = decompress(compressed);
++        assertArrayEquals(original, decompressed);
++    }
++
++    @Test
++    void testLongRepeatingString() throws IOException {
++        final byte[] original = "aaaaabbbbbcccccdddddeeeee".getBytes();
++        final byte[] compressed = compress(original);
++        final byte[] decompressed = decompress(compressed);
++        assertArrayEquals(original, decompressed);
++    }
++
++    @Test
++    void testSingleByteReadConsistentlyReturnsMinusOneAtEof() throws IOException {
++        final byte[] original = "test".getBytes();
++        final byte[] compressed = compress(original);
++        try (InputStream in = new LZ77CompressorInputStream(new ByteArrayInputStream(compressed))) {
++            IOUtils.toByteArray(in);
++            assertEquals(-1, in.read());
++            assertEquals(-1, in.read());
++        }
++    }
++
++    private byte[] compress(final byte[] data) throws IOException {
++        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
++                LZ77CompressorOutputStream out = new LZ77CompressorOutputStream(baos)) {
++            out.write(data);
++            out.finish();
++            return baos.toByteArray();
++        }
++    }
++
++    private byte[] decompress(final byte[] data) throws IOException {
++        try (LZ77CompressorInputStream in = new LZ77CompressorInputStream(new ByteArrayInputStream(data))) {
++            return IOUtils.toByteArray(in);
++        }
++    }
++}
