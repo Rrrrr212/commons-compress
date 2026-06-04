@@ -1026,14 +1026,6 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (offset > buffer.length || length < 0 || offset < 0 || buffer.length - offset < length) {
             throw new ArrayIndexOutOfBoundsException();
         }
-        validateRead();
-        final int read = readByMethod(buffer, offset, length);
-        updateCrcAndCount(read, buffer, offset);
-        return read;
-    }
-
-    // NEW METHOD: validateRead - extracts feature validation logic from read()
-    private void validateRead() throws IOException {
         ZipUtil.checkRequestedFeatures(current.entry);
         if (!supportsDataDescriptorFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.DATA_DESCRIPTOR, current.entry);
@@ -1041,34 +1033,27 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (!supportsCompressedSizeFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.UNKNOWN_COMPRESSED_SIZE, current.entry);
         }
-    }
-
-    // NEW METHOD: readByMethod - extracts compression method dispatch logic from read()
-    private int readByMethod(final byte[] buffer, final int offset, final int length) throws IOException {
+        final int read;
         final int method = current.entry.getMethod();
         if (method == ZipArchiveOutputStream.STORED) {
-            return readStored(buffer, offset, length);
-        }
-        if (method == ZipArchiveOutputStream.DEFLATED) {
-            return readDeflated(buffer, offset, length);
-        }
-        if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode() || method == ZipMethod.ENHANCED_DEFLATED.getCode()
+            read = readStored(buffer, offset, length);
+        } else if (method == ZipArchiveOutputStream.DEFLATED) {
+            read = readDeflated(buffer, offset, length);
+        } else if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode() || method == ZipMethod.ENHANCED_DEFLATED.getCode()
                 || method == ZipMethod.BZIP2.getCode() || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode()) {
             try {
-                return current.checkInputStream().read(buffer, offset, length);
+                read = current.checkInputStream().read(buffer, offset, length);
             } catch (final RuntimeException e) {
                 throw new ArchiveException(e);
             }
+        } else {
+            throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
         }
-        throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
-    }
-
-    // NEW METHOD: updateCrcAndCount - extracts CRC update and byte counting logic from read()
-    private void updateCrcAndCount(final int read, final byte[] buffer, final int offset) {
         if (read >= 0) {
             current.crc.update(buffer, offset, read);
             uncompressedCount += read;
         }
+        return read;
     }
 
     private void readDataDescriptor() throws IOException {
