@@ -1033,42 +1033,27 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (!supportsCompressedSizeFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.UNKNOWN_COMPRESSED_SIZE, current.entry);
         }
-        final int read = readChunk(buffer, offset, length);
-        updateCrc(buffer, offset, read);
-        return read;
-    }
-
-    // NEW METHOD: isolates compression-method dispatch so read() keeps validation and post-read bookkeeping only.
-    private int readChunk(final byte[] buffer, final int offset, final int length) throws IOException {
+        final int read;
         final int method = current.entry.getMethod();
         if (method == ZipArchiveOutputStream.STORED) {
-            return readStored(buffer, offset, length);
-        }
-        if (method == ZipArchiveOutputStream.DEFLATED) {
-            return readDeflated(buffer, offset, length);
-        }
-        if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode() || method == ZipMethod.ENHANCED_DEFLATED.getCode()
+            read = readStored(buffer, offset, length);
+        } else if (method == ZipArchiveOutputStream.DEFLATED) {
+            read = readDeflated(buffer, offset, length);
+        } else if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode() || method == ZipMethod.ENHANCED_DEFLATED.getCode()
                 || method == ZipMethod.BZIP2.getCode() || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode()) {
-            return readDelegatedChunk(buffer, offset, length);
+            try {
+                read = current.checkInputStream().read(buffer, offset, length);
+            } catch (final RuntimeException e) {
+                throw new ArchiveException(e);
+            }
+        } else {
+            throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
         }
-        throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
-    }
-
-    // NEW METHOD: keeps exception translation at the boundary where delegated decompressors are invoked.
-    private int readDelegatedChunk(final byte[] buffer, final int offset, final int length) throws IOException {
-        try {
-            return current.checkInputStream().read(buffer, offset, length);
-        } catch (final RuntimeException e) {
-            throw new ArchiveException(e);
-        }
-    }
-
-    // NEW METHOD: centralizes post-read bookkeeping and only updates counters when bytes were produced.
-    private void updateCrc(final byte[] buffer, final int offset, final int read) {
         if (read >= 0) {
             current.crc.update(buffer, offset, read);
             uncompressedCount += read;
         }
+        return read;
     }
 
     private void readDataDescriptor() throws IOException {
