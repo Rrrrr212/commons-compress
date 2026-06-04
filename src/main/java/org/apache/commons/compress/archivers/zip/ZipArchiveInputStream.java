@@ -1026,19 +1026,6 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (offset > buffer.length || length < 0 || offset < 0 || buffer.length - offset < length) {
             throw new ArrayIndexOutOfBoundsException();
         }
-        
-        // 1. 检查请求特征与大小
-        checkRequestedFeaturesAndSize();
-        
-        // 2. 根据压缩方法读取数据块
-        final int read = readChunk(buffer, offset, length);
-        
-        // 3. 更新 CRC 和解压计数
-        return updateCrc(buffer, offset, read);
-    }
-
-    // NEW METHOD: 提取请求特征与大小检查逻辑
-    private void checkRequestedFeaturesAndSize() throws IOException {
         ZipUtil.checkRequestedFeatures(current.entry);
         if (!supportsDataDescriptorFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.DATA_DESCRIPTOR, current.entry);
@@ -1046,10 +1033,6 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (!supportsCompressedSizeFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.UNKNOWN_COMPRESSED_SIZE, current.entry);
         }
-    }
-
-    // NEW METHOD: 提取核心解压逻辑
-    private int readChunk(final byte[] buffer, final int offset, final int length) throws IOException {
         final int read;
         final int method = current.entry.getMethod();
         if (method == ZipArchiveOutputStream.STORED) {
@@ -1066,11 +1049,6 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         } else {
             throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
         }
-        return read;
-    }
-
-    // NEW METHOD: 提取 CRC 与计数更新逻辑
-    private int updateCrc(final byte[] buffer, final int offset, final int read) {
         if (read >= 0) {
             current.crc.update(buffer, offset, read);
             uncompressedCount += read;

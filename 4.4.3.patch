@@ -1,0 +1,47 @@
+diff --git a/src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java b/src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java
+index 8cc75880c..f906805f6 100644
+--- a/src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java
++++ b/src/main/java/org/apache/commons/compress/archivers/zip/ZipArchiveInputStream.java
+@@ -1026,6 +1026,19 @@ public int read(final byte[] buffer, final int offset, final int length) throws
+         if (offset > buffer.length || length < 0 || offset < 0 || buffer.length - offset < length) {
+             throw new ArrayIndexOutOfBoundsException();
+         }
++        
++        // 1. 检查请求特征与大小
++        checkRequestedFeaturesAndSize();
++        
++        // 2. 根据压缩方法读取数据块
++        final int read = readChunk(buffer, offset, length);
++        
++        // 3. 更新 CRC 和解压计数
++        return updateCrc(buffer, offset, read);
++    }
++
++    // NEW METHOD: 提取请求特征与大小检查逻辑
++    private void checkRequestedFeaturesAndSize() throws IOException {
+         ZipUtil.checkRequestedFeatures(current.entry);
+         if (!supportsDataDescriptorFor(current.entry)) {
+             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.DATA_DESCRIPTOR, current.entry);
+@@ -1033,6 +1046,10 @@ public int read(final byte[] buffer, final int offset, final int length) throws
+         if (!supportsCompressedSizeFor(current.entry)) {
+             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.UNKNOWN_COMPRESSED_SIZE, current.entry);
+         }
++    }
++
++    // NEW METHOD: 提取核心解压逻辑
++    private int readChunk(final byte[] buffer, final int offset, final int length) throws IOException {
+         final int read;
+         final int method = current.entry.getMethod();
+         if (method == ZipArchiveOutputStream.STORED) {
+@@ -1049,6 +1066,11 @@ public int read(final byte[] buffer, final int offset, final int length) throws
+         } else {
+             throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
+         }
++        return read;
++    }
++
++    // NEW METHOD: 提取 CRC 与计数更新逻辑
++    private int updateCrc(final byte[] buffer, final int offset, final int read) {
+         if (read >= 0) {
+             current.crc.update(buffer, offset, read);
+             uncompressedCount += read;
