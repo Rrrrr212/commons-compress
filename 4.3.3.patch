@@ -1,0 +1,101 @@
+import org.apache.commons.compress.archivers.ArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
+import org.apache.commons.compress.archivers.zip.ZipFile;
+import org.apache.commons.compress.utils.IOUtils;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.Enumeration;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public class SafeZipExtractor {
+    private static final Logger LOGGER = Logger.getLogger(SafeZipExtractor.class.getName());
+    
+    // 设定最大允许的解压大小 (例如 1GB)，防止解压炸弹 (Zip Bomb)
+    private static final long MAX_ENTRY_SIZE = 1024L * 1024L * 1024L; 
+
+    /**
+     * 安全解压 ZIP 文件，包含防 Zip Slip、大小校验以及针对损坏条目的异常恢复逻辑。
+     * 
+     * @param zipFile   要解压的 ZIP 文件
+     * @param outputDir 输出目录
+     */
+    public static void extractZipSafely(File zipFile, File outputDir) {
+        if (!outputDir.exists() && !outputDir.mkdirs()) {
+            LOGGER.severe("无法创建输出目录: " + outputDir.getAbsolutePath());
+            return;
+        }
+
+        try {
+            String canonicalOutputDir = outputDir.getCanonicalPath();
+
+            // 强烈推荐使用 ZipFile 的 Builder。
+            // ZipFile 通过读取中央目录获取准确的元数据和偏移量，对 DEFLATE64 兼容性极佳。
+            try (ZipFile zip = ZipFile.builder().setFile(zipFile).get()) {
+                Enumeration<ZipArchiveEntry> entries = zip.getEntries();
+                
+                while (entries.hasMoreElements()) {
+                    ZipArchiveEntry entry = entries.nextElement();
+                    
+                    // 1. 大小校验：防止 Zip Bomb (解压炸弹) 或意外的超大文件
+                    long uncompressedSize = entry.getSize();
+                    if (uncompressedSize > MAX_ENTRY_SIZE) {
+                        LOGGER.warning(String.format("跳过条目 %s：解压大小 (%d 字节) 超过最大限制。", entry.getName(), uncompressedSize));
+                        continue;
+                    }
+                    if (uncompressedSize == ArchiveEntry.SIZE_UNKNOWN) {
+                        LOGGER.warning("条目 " + entry.getName() + " 的大小未知，存在安全风险，已跳过。");
+                        continue;
+                    }
+
+                    File outputFile = new File(outputDir, entry.getName());
+                    String canonicalOutputFile = outputFile.getCanonicalPath();
+
+                    // 2. 防御 Zip Slip 漏洞：确保解压出的文件没有越界 (防止包含 "../" 等恶意路径)
+                    if (!canonicalOutputFile.startsWith(canonicalOutputDir + File.separator)) {
+                        LOGGER.warning("跳过条目 " + entry.getName() + "：检测到越界访问，疑似 Zip Slip 攻击。");
+                        continue;
+                    }
+
+                    if (entry.isDirectory()) {
+                        if (!outputFile.exists() && !outputFile.mkdirs()) {
+                            LOGGER.warning("无法创建目录: " + outputFile.getAbsolutePath());
+                        }
+                        continue;
+                    }
+
+                    // 确保文件的父级目录存在
+                    File parentDir = outputFile.getParentFile();
+                    if (!parentDir.exists() && !parentDir.mkdirs()) {
+                        LOGGER.warning("无法创建父目录: " + parentDir.getAbsolutePath());
+                        continue;
+                    }
+
+                    // 3. 异常恢复逻辑：在单个条目级别捕获异常，确保整体解压不被中断
+                    try (InputStream is = zip.getInputStream(entry);
+                         OutputStream os = new FileOutputStream(outputFile)) {
+                        
+                        // 使用 Commons Compress 的 IOUtils 高效并安全地复制流数据
+                        IOUtils.copy(is, os);
+                        LOGGER.info("成功解压: " + entry.getName());
+                        
+                    } catch (IOException e) {
+                        // DEFLATE64 解压失败或局部数据损坏时，仅捕获并记录日志，继续处理下一个条目
+                        LOGGER.log(Level.WARNING, "解压条目失败 (文件可能已损坏): " + entry.getName() + "，已跳过。", e);
+                        
+                        // 清理因解压中断而产生的不完整/损坏文件
+                        if (outputFile.exists() && !outputFile.delete()) {
+                            LOGGER.warning("无法清理损坏的部分文件: " + outputFile.getAbsolutePath());
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "打开或读取整个 ZIP 文件失败 (ZIP 文件头/结构可能完全损坏): " + zipFile.getAbsolutePath(), e);
+        }
+    }
+}
