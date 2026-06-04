@@ -1,0 +1,522 @@
+#!/usr/bin/env bash
+#
+# CI / 本地统一构建检查脚本
+# 适用于 Apache Commons Compress (org.apache.commons:commons-compress)
+# 基于 Maven 依赖: <groupId>org.apache.commons</groupId><artifactId>commons-compress</artifactId><version>1.28.0</version>
+#
+# 用法:
+#   chmod +x ci-build-check.sh
+#   ./ci-build-check.sh
+#
+
+set -o pipefail
+set -o errexit
+
+# ──────────────────────────────────────────────
+# 颜色定义
+# ──────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# ──────────────────────────────────────────────
+# 可配置参数
+# ──────────────────────────────────────────────
+COVERAGE_THRESHOLD=80
+MVN_GOALS="clean verify"
+MAVEN_OPTS="${MAVEN_OPTS:--Xmx2048m}"
+export MAVEN_OPTS
+
+# ──────────────────────────────────────────────
+# 全局变量
+# ──────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_LOG="${SCRIPT_DIR}/target/build.log"
+FAILED_STAGE=""
+BUILD_EXIT_CODE=0
+
+# ──────────────────────────────────────────────
+# 工具函数
+# ──────────────────────────────────────────────
+
+print_header() {
+    echo ""
+    echo -e "${BLUE}════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}  $1${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[PASS]${NC} $1"
+}
+
+print_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[FAIL]${NC} $1"
+}
+
+print_stage() {
+    echo -e "${YELLOW}[STAGE]${NC} $1"
+}
+
+# ──────────────────────────────────────────────
+# Step 1: JDK 版本检测
+# ──────────────────────────────────────────────
+check_jdk_version() {
+    print_header "1. JDK 版本检测"
+
+    if ! command -v java &>/dev/null; then
+        print_error "未检测到 java 命令，请安装 JDK 8+"
+        exit 1
+    fi
+
+    local java_version
+    java_version=$(java -version 2>&1 | head -1 | awk -F '"' '{print $2}')
+
+    if [[ -z "$java_version" ]]; then
+        print_error "无法解析 Java 版本号"
+        exit 1
+    fi
+
+    print_info "检测到 JDK 版本: $java_version"
+
+    local major_version
+    if [[ "$java_version" == 1.* ]]; then
+        major_version=$(echo "$java_version" | cut -d'.' -f2)
+    else
+        major_version=$(echo "$java_version" | cut -d'.' -f1)
+    fi
+
+    if [[ "$major_version" -lt 8 ]]; then
+        print_error "JDK 版本过低: ${java_version}, 要求 JDK 8+"
+        exit 1
+    fi
+
+    print_success "JDK 版本满足要求 (${major_version} >= 8)"
+
+    if ! command -v javac &>/dev/null; then
+        print_warn "未检测到 javac 命令，仅检测到 JRE。Maven 编译需要 JDK（非 JRE）"
+    else
+        print_info "JAVA_HOME: ${JAVA_HOME:-未设置}"
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Step 2: 检查 Maven 可用性
+# ──────────────────────────────────────────────
+check_maven() {
+    print_header "2. Maven 环境检测"
+
+    if ! command -v mvn &>/dev/null; then
+        print_error "未检测到 mvn 命令，请安装 Maven 3.x+"
+        exit 1
+    fi
+
+    local mvn_version
+    mvn_version=$(mvn --version 2>&1 | head -1)
+    print_info "$mvn_version"
+
+    print_success "Maven 环境就绪"
+}
+
+# ──────────────────────────────────────────────
+# Step 3: 执行 Maven 构建
+# ──────────────────────────────────────────────
+run_maven_build() {
+    print_header "3. 执行 Maven 构建: mvn ${MVN_GOALS}"
+
+    mkdir -p "${SCRIPT_DIR}/target"
+
+    print_info "MAVEN_OPTS=${MAVEN_OPTS}"
+    print_info "构建目标: ${MVN_GOALS}"
+
+    local mvn_start
+    mvn_start=$(date +%s)
+
+    set +e
+    mvn ${MVN_GOALS} \
+        --errors \
+        --show-version \
+        --batch-mode \
+        --no-transfer-progress \
+        2>&1 | tee "${BUILD_LOG}"
+    BUILD_EXIT_CODE=${PIPESTATUS[0]}
+    set -e
+
+    local mvn_end
+    mvn_end=$(date +%s)
+    local elapsed=$((mvn_end - mvn_start))
+
+    print_info "构建耗时: ${elapsed} 秒"
+
+    if [[ "$BUILD_EXIT_CODE" -ne 0 ]]; then
+        print_error "Maven 构建失败, 退出码: ${BUILD_EXIT_CODE}"
+        detect_failed_stage
+        print_build_failure_summary
+        exit "$BUILD_EXIT_CODE"
+    fi
+
+    print_success "Maven 构建成功"
+}
+
+# ──────────────────────────────────────────────
+# Step 4: 检测构建失败阶段
+# ──────────────────────────────────────────────
+detect_failed_stage() {
+    print_header "4. 构建失败阶段诊断"
+
+    if [[ ! -f "${BUILD_LOG}" ]]; then
+        print_warn "未找到构建日志: ${BUILD_LOG}"
+        return
+    fi
+
+    # 编译失败
+    if grep -q "COMPILATION ERROR" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="编译 (compile)"
+        print_error "检测到编译错误"
+
+    # Checkstyle 失败
+    elif grep -qE "\[ERROR\].*checkstyle" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="代码风格检查 (checkstyle)"
+        print_error "检测到 Checkstyle 违规"
+
+    # PMD 失败
+    elif grep -qE "\[ERROR\].*pmd" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="静态代码检查 (PMD)"
+        print_error "检测到 PMD 违规"
+
+    # SpotBugs 失败
+    elif grep -qE "\[ERROR\].*spotbugs" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="静态代码检查 (SpotBugs)"
+        print_error "检测到 SpotBugs 问题"
+
+    # JaCoCo 覆盖不足
+    elif grep -qE "\[ERROR\].*jacoco|Rule violated" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="代码覆盖率 (JaCoCo)"
+        print_error "检测到代码覆盖率不足"
+
+    # 测试失败
+    elif grep -qE "Tests run:.*Failures:" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="测试 (test)"
+        print_error "检测到测试失败"
+
+    # RAT 检查失败
+    elif grep -qE "\[ERROR\].*rat" "${BUILD_LOG}" 2>/dev/null; then
+        FAILED_STAGE="许可证头检查 (RAT)"
+        print_error "检测到许可证头问题"
+
+    # 默认未知阶段
+    else
+        FAILED_STAGE="未知阶段"
+        print_error "无法自动识别失败阶段，请检查日志"
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Step 5: 输出错误日志摘要
+# ──────────────────────────────────────────────
+print_build_failure_summary() {
+    print_header "5. 错误日志摘要"
+
+    print_info "失败阶段: ${FAILED_STAGE}"
+
+    # ── 输出 Maven 构建日志中的 ERROR 行 ──
+    local error_lines
+    error_lines=$(grep -c '\[ERROR\]' "${BUILD_LOG}" 2>/dev/null || echo 0)
+    if [[ "$error_lines" -gt 0 ]]; then
+        print_info "Maven ERROR 行数: ${error_lines}"
+        echo ""
+        echo "───────────────────────────────────────────────────────"
+        echo "  Maven ERROR 日志 (最后 50 行):"
+        echo "───────────────────────────────────────────────────────"
+        grep '\[ERROR\]' "${BUILD_LOG}" | tail -50 || true
+        echo "───────────────────────────────────────────────────────"
+        echo ""
+    fi
+
+    # ── Surefire 测试报告 ──
+    summarize_surefire_reports
+
+    # ── Checkstyle 报告 ──
+    summarize_checkstyle_report
+}
+
+summarize_surefire_reports() {
+    local surefire_dir="${SCRIPT_DIR}/target/surefire-reports"
+    if [[ ! -d "$surefire_dir" ]]; then
+        return
+    fi
+
+    local txt_files
+    txt_files=$(find "$surefire_dir" -name "*.txt" -type f 2>/dev/null | wc -l)
+    if [[ "$txt_files" -eq 0 ]]; then
+        return
+    fi
+
+    echo "───────────────────────────────────────────────────────"
+    echo "  Surefire 测试摘要:"
+    echo "───────────────────────────────────────────────────────"
+
+    local total_tests=0 total_errors=0 total_failures=0 total_skipped=0
+    for report in "$surefire_dir"/*.txt; do
+        [[ -f "$report" ]] || continue
+        while IFS= read -r line; do
+            if [[ "$line" =~ Tests\ run:\ ([0-9]+),\ Failures:\ ([0-9]+),\ Errors:\ ([0-9]+),\ Skipped:\ ([0-9]+) ]]; then
+                total_tests=$((total_tests + BASH_REMATCH[1]))
+                total_failures=$((total_failures + BASH_REMATCH[2]))
+                total_errors=$((total_errors + BASH_REMATCH[3]))
+                total_skipped=$((total_skipped + BASH_REMATCH[4]))
+            fi
+        done < "$report"
+    done
+
+    echo "  Tests run: ${total_tests}, Failures: ${total_failures}, Errors: ${total_errors}, Skipped: ${total_skipped}"
+
+    if [[ "$total_failures" -gt 0 ]]; then
+        echo ""
+        echo "  失败的测试类:"
+        grep -rl 'FAILED' "$surefire_dir"/*.txt 2>/dev/null | while read -r f; do
+            local class_name
+            class_name=$(basename "$f" .txt)
+            echo "    - ${class_name}"
+        done
+    fi
+
+    echo "───────────────────────────────────────────────────────"
+}
+
+summarize_checkstyle_report() {
+    local checkstyle_report="${SCRIPT_DIR}/target/checkstyle-result.xml"
+    if [[ -f "$checkstyle_report" ]]; then
+        local violations
+        violations=$(grep -c '<error ' "$checkstyle_report" 2>/dev/null || echo 0)
+        print_info "Checkstyle 违规数: ${violations}"
+    fi
+}
+
+# ──────────────────────────────────────────────
+# Step 6: JaCoCo 代码覆盖率检查
+# ──────────────────────────────────────────────
+check_jacoco_coverage() {
+    print_header "6. JaCoCo 代码覆盖率检查"
+
+    local jacoco_csv="${SCRIPT_DIR}/target/site/jacoco/jacoco.csv"
+
+    if [[ ! -f "$jacoco_csv" ]]; then
+        print_warn "未找到 JaCoCo CSV 报告: ${jacoco_csv}"
+        print_info "尝试寻找其他 JaCoCo 报告位置..."
+
+        local alt_csv
+        alt_csv=$(find "${SCRIPT_DIR}/target" -name "jacoco.csv" -type f 2>/dev/null | head -1)
+        if [[ -n "$alt_csv" ]]; then
+            jacoco_csv="$alt_csv"
+            print_info "找到: ${jacoco_csv}"
+        else
+            print_error "未找到 JaCoCo 报告文件, 请在 pom.xml 中配置 jacoco-maven-plugin"
+            print_info "示例配置:"
+            echo ""
+            echo "  <plugin>"
+            echo "    <groupId>org.jacoco</groupId>"
+            echo "    <artifactId>jacoco-maven-plugin</artifactId>"
+            echo "    <version>0.8.12</version>"
+            echo "    <executions>"
+            echo "      <execution>"
+            echo "        <goals><goal>prepare-agent</goal></goals>"
+            echo "      </execution>"
+            echo "      <execution>"
+            echo "        <id>report</id>"
+            echo "        <phase>verify</phase>"
+            echo "        <goals><goal>report</goal></goals>"
+            echo "      </execution>"
+            echo "    </executions>"
+            echo "  </plugin>"
+            return 1
+        fi
+    fi
+
+    print_info "解析覆盖率报告: ${jacoco_csv}"
+
+    # JaCoCo CSV 格式:
+    # GROUP,PACKAGE,CLASS,INSTRUCTION_MISSED,INSTRUCTION_COVERED,BRANCH_MISSED,BRANCH_COVERED,LINE_MISSED,LINE_COVERED,COMPLEXITY_MISSED,COMPLEXITY_COVERED,METHOD_MISSED,METHOD_COVERED
+
+    local total_instruction_missed=0 total_instruction_covered=0
+    local total_branch_missed=0 total_branch_covered=0
+    local total_line_missed=0 total_line_covered=0
+    local total_method_missed=0 total_method_covered=0
+    local total_complexity_missed=0 total_complexity_covered=0
+
+    while IFS=',' read -r group package class inst_missed inst_covered branch_missed branch_covered line_missed line_covered comp_missed comp_covered method_missed method_covered; do
+        [[ "$group" == "GROUP" ]] && continue
+        [[ -z "$inst_missed" ]] && continue
+
+        total_instruction_missed=$((total_instruction_missed + inst_missed))
+        total_instruction_covered=$((total_instruction_covered + inst_covered))
+        total_branch_missed=$((total_branch_missed + branch_missed))
+        total_branch_covered=$((total_branch_covered + branch_covered))
+        total_line_missed=$((total_line_missed + line_missed))
+        total_line_covered=$((total_line_covered + line_covered))
+        total_method_missed=$((total_method_missed + method_missed))
+        total_method_covered=$((total_method_covered + method_covered))
+        total_complexity_missed=$((total_complexity_missed + comp_missed))
+        total_complexity_covered=$((total_complexity_covered + comp_covered))
+    done < "$jacoco_csv"
+
+    local ratio_instruction=0 ratio_branch=0 ratio_line=0 ratio_method=0 ratio_complexity=0
+
+    calc_ratio() {
+        local missed=$1 covered=$2
+        local total=$((missed + covered))
+        if [[ "$total" -gt 0 ]]; then
+            echo "scale=1; ${covered} * 100 / ${total}" | bc
+        else
+            echo "0"
+        fi
+    }
+
+    ratio_instruction=$(calc_ratio "$total_instruction_missed" "$total_instruction_covered")
+    ratio_branch=$(calc_ratio "$total_branch_missed" "$total_branch_covered")
+    ratio_line=$(calc_ratio "$total_line_missed" "$total_line_covered")
+    ratio_method=$(calc_ratio "$total_method_missed" "$total_method_covered")
+    ratio_complexity=$(calc_ratio "$total_complexity_missed" "$total_complexity_covered")
+
+    echo ""
+    echo "───────────────────────────────────────────────────────"
+    echo "  JaCoCo 代码覆盖率报告:"
+    echo "───────────────────────────────────────────────────────"
+    printf "  指令覆盖率 (Instruction):  %6.1f%%\n" "$ratio_instruction"
+    printf "  分支覆盖率 (Branch):       %6.1f%%\n" "$ratio_branch"
+    printf "  行覆盖率   (Line):          %6.1f%%\n" "$ratio_line"
+    printf "  方法覆盖率 (Method):        %6.1f%%\n" "$ratio_method"
+    printf "  圈复杂度   (Complexity):    %6.1f%%\n" "$ratio_complexity"
+    echo "───────────────────────────────────────────────────────"
+    echo ""
+
+    local coverage_passed=true
+
+    check_threshold() {
+        local name=$1 value=$2 threshold=$3
+        if (( $(echo "$value < $threshold" | bc -l) )); then
+            print_error "${name} 覆盖率 ${value}% 低于阈值 ${threshold}%"
+            return 1
+        else
+            print_success "${name} 覆盖率 ${value}% >= ${threshold}%"
+            return 0
+        fi
+    }
+
+    check_threshold "指令" "$ratio_instruction" "$COVERAGE_THRESHOLD" || coverage_passed=false
+    check_threshold "分支" "$ratio_branch" "$COVERAGE_THRESHOLD" || coverage_passed=false
+    check_threshold "行" "$ratio_line" "$COVERAGE_THRESHOLD" || coverage_passed=false
+    check_threshold "方法" "$ratio_method" "$COVERAGE_THRESHOLD" || coverage_passed=false
+
+    local html_report="${SCRIPT_DIR}/target/site/jacoco/index.html"
+    if [[ -f "$html_report" ]]; then
+        print_info "HTML 覆盖率报告: file://${html_report}"
+    fi
+
+    if [[ "$coverage_passed" == "false" ]]; then
+        print_error "代码覆盖率未达到 ${COVERAGE_THRESHOLD}% 阈值!"
+        return 1
+    fi
+
+    print_success "代码覆盖率达标 (>= ${COVERAGE_THRESHOLD}%)"
+    return 0
+}
+
+# ──────────────────────────────────────────────
+# Step 7: 输出关键调试信息
+# ──────────────────────────────────────────────
+print_debug_info() {
+    print_header "7. 关键调试信息"
+
+    echo "───────────────────────────────────────────────────────"
+    echo "  环境信息:"
+    echo "───────────────────────────────────────────────────────"
+    echo "  操作系统:   $(uname -a 2>/dev/null || echo 'N/A')"
+    echo "  Java 版本:  $(java -version 2>&1 | head -1 || echo 'N/A')"
+    echo "  JAVA_HOME:  ${JAVA_HOME:-未设置}"
+    echo "  Maven 版本: $(mvn --version 2>&1 | head -1 || echo 'N/A')"
+    echo "  MAVEN_OPTS: ${MAVEN_OPTS:-未设置}"
+    echo "  工作目录:   ${SCRIPT_DIR}"
+    echo ""
+
+    echo "───────────────────────────────────────────────────────"
+    echo "  构建产物:"
+    echo "───────────────────────────────────────────────────────"
+    if [[ -d "${SCRIPT_DIR}/target" ]]; then
+        ls -lh "${SCRIPT_DIR}/target"/*.jar 2>/dev/null || echo "  (无 jar 产物)"
+        echo ""
+        echo "  target/ 目录占用:"
+        du -sh "${SCRIPT_DIR}/target" 2>/dev/null || true
+    fi
+    echo ""
+
+    echo "───────────────────────────────────────────────────────"
+    echo "  构建阶段耗时 (Maven 日志中提取):"
+    echo "───────────────────────────────────────────────────────"
+
+    if [[ -f "${BUILD_LOG}" ]]; then
+        grep -E "^\[INFO\] --- " "${BUILD_LOG}" 2>/dev/null | head -20 || true
+    fi
+    echo ""
+
+    if [[ -f "${BUILD_LOG}" ]]; then
+        echo "───────────────────────────────────────────────────────"
+        echo "  Maven 构建日志大小:"
+        echo "───────────────────────────────────────────────────────"
+        wc -l "${BUILD_LOG}" 2>/dev/null || true
+        ls -lh "${BUILD_LOG}" 2>/dev/null || true
+    fi
+    echo ""
+
+    echo "───────────────────────────────────────────────────────"
+    echo "  target/ 目录内容概要:"
+    echo "───────────────────────────────────────────────────────"
+    if [[ -d "${SCRIPT_DIR}/target" ]]; then
+        ls -1 "${SCRIPT_DIR}/target/" 2>/dev/null || true
+    fi
+    echo ""
+}
+
+# ──────────────────────────────────────────────
+# 主流程
+# ──────────────────────────────────────────────
+main() {
+    print_header "Apache Commons Compress CI/本地构建检查"
+    print_info "脚本路径: ${SCRIPT_DIR}"
+    print_info "覆盖率阈值: ${COVERAGE_THRESHOLD}%"
+
+    check_jdk_version
+    check_maven
+
+    print_info "开始执行 Maven 构建..."
+    run_maven_build
+
+    print_info "开始检查代码覆盖率..."
+    set +e
+    check_jacoco_coverage
+    local coverage_rc=$?
+    set -e
+
+    print_debug_info
+
+    if [[ "$coverage_rc" -ne 0 ]]; then
+        print_error "构建检查完成: 代码覆盖率不达标"
+        exit 1
+    fi
+
+    print_success "所有构建检查通过!"
+    exit 0
+}
+
+main "$@"
