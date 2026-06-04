@@ -116,13 +116,13 @@ class HuffmanDecoder implements Closeable {
             return newCounter;
         }
 
-        void recordToBuffer(final int distance, final int length, final byte[] buff) throws IOException {
+        void recordToBuffer(final int distance, final int length, final byte[] buff) {
             if (distance > memory.length) {
-                throw new IOException("Corrupt Deflate64 stream: illegal distance parameter " + distance + " exceeds buffer size " + memory.length);
+                throw new IllegalStateException("Illegal distance parameter: " + distance);
             }
             final int start = wHead - distance & mask;
             if (!wrappedAround && start >= wHead) {
-                throw new IOException("Corrupt Deflate64 stream: attempt to read beyond memory, dist=" + distance);
+                throw new IllegalStateException("Attempt to read beyond memory: dist=" + distance);
             }
             for (int i = 0, pos = start; i < length; i++, pos = incCounter(pos)) {
                 buff[i] = add(memory[pos]);
@@ -173,18 +173,12 @@ class HuffmanDecoder implements Closeable {
                 if (symbol < 256) {
                     b[off + result++] = memory.add((byte) symbol);
                 } else if (symbol > 256) {
-                    if (symbol - 257 >= RUN_LENGTH_TABLE.length) {
-                        throw new IOException("Corrupt Deflate64 stream: invalid length symbol " + symbol);
-                    }
                     final int runMask = RUN_LENGTH_TABLE[symbol - 257];
                     int run = runMask >>> 5;
                     final int runXtra = runMask & 0x1F;
                     run = ExactMath.add(run, readBits(runXtra));
 
                     final int distSym = nextSymbol(reader, distanceTree);
-                    if (distSym < 0 || distSym >= DISTANCE_TABLE.length) {
-                        throw new IOException("Corrupt Deflate64 stream: invalid distance symbol " + distSym);
-                    }
 
                     final int distMask = DISTANCE_TABLE[distSym];
                     int dist = distMask >>> 4;
@@ -429,10 +423,7 @@ class HuffmanDecoder implements Closeable {
             final long bit = readBits(reader, 1);
             node = bit == 0 ? node.leftNode : node.rightNode;
         }
-        if (node == null) {
-            throw new IOException("Corrupt Deflate64 stream: invalid Huffman code encountered");
-        }
-        return node.literal;
+        return node != null ? node.literal : -1;
     }
 
     private static void populateDynamicTables(final BitInputStream reader, final int[] literals, final int[] distances) throws IOException {
