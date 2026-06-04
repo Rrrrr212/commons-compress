@@ -1033,27 +1033,44 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (!supportsCompressedSizeFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.UNKNOWN_COMPRESSED_SIZE, current.entry);
         }
-        final int read;
+        // ---- extraction boundary: dispatch to method-specific decompression ----
         final int method = current.entry.getMethod();
+        final int read = readChunk(buffer, offset, length, method);
+        if (read < 0) {
+            return read;
+        }
+        // ---- extraction boundary: post-read CRC and counter update ----
+        updateCrc(buffer, offset, read);
+        return read;
+    }
+
+    // NEW METHOD: core decompression dispatch — routes to the appropriate read
+    // implementation based on the entry's compression method (STORED, DEFLATED,
+    // or stream-based for UNSHRINKING/IMPLODING/ENHANCED_DEFLATED/BZIP2/Zstd/XZ)
+    private int readChunk(final byte[] buffer, final int offset, final int length, final int method) throws IOException {
         if (method == ZipArchiveOutputStream.STORED) {
-            read = readStored(buffer, offset, length);
-        } else if (method == ZipArchiveOutputStream.DEFLATED) {
-            read = readDeflated(buffer, offset, length);
-        } else if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode() || method == ZipMethod.ENHANCED_DEFLATED.getCode()
-                || method == ZipMethod.BZIP2.getCode() || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode()) {
+            return readStored(buffer, offset, length);
+        }
+        if (method == ZipArchiveOutputStream.DEFLATED) {
+            return readDeflated(buffer, offset, length);
+        }
+        if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode()
+                || method == ZipMethod.ENHANCED_DEFLATED.getCode() || method == ZipMethod.BZIP2.getCode()
+                || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode()) {
             try {
-                read = current.checkInputStream().read(buffer, offset, length);
+                return current.checkInputStream().read(buffer, offset, length);
             } catch (final RuntimeException e) {
                 throw new ArchiveException(e);
             }
-        } else {
-            throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
         }
-        if (read >= 0) {
-            current.crc.update(buffer, offset, read);
-            uncompressedCount += read;
-        }
-        return read;
+        throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
+    }
+
+    // NEW METHOD: post-read CRC update — advances the entry-level CRC32 checksum
+    // and the global uncompressed byte counter after a successful chunk read
+    private void updateCrc(final byte[] buffer, final int offset, final int read) {
+        current.crc.update(buffer, offset, read);
+        uncompressedCount += read;
     }
 
     private void readDataDescriptor() throws IOException {
