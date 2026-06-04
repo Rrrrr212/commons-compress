@@ -1,0 +1,526 @@
+diff --git a/src/main/java/org/apache/commons/compress/archivers/zip/ZipCharsetDetectorUtil.java b/src/main/java/org/apache/commons/compress/archivers/zip/ZipCharsetDetectorUtil.java
+new file mode 100644
+index 000000000..efe4756e0
+--- /dev/null
++++ b/src/main/java/org/apache/commons/compress/archivers/zip/ZipCharsetDetectorUtil.java
+@@ -0,0 +1,198 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.commons.compress.archivers.zip;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import org.apache.commons.io.IOUtils;
++
++/**
++ * Utility class for detecting the charset of ZIP entry names and extracting
++ * ZIP archives with automatic charset detection.
++ * <p>
++ * This is particularly useful for ZIP files created on Windows with Chinese locale
++ * where file names are encoded in GBK/GB18030 but the EFS flag (UTF-8 indicator)
++ * is not set in the ZIP entry headers.
++ * </p>
++ *
++ * @Immutable
++ * @since 1.30
++ */
++public abstract class ZipCharsetDetectorUtil {
++
++    private static final Charset GBK = lookupCharset("GBK");
++
++    private static Charset lookupCharset(final String name) {
++        try {
++            return Charset.forName(name);
++        } catch (final Exception ignored) {
++            return null;
++        }
++    }
++
++    /**
++     * Detects the most likely charset for the given byte array.
++     * <p>
++     * The detection algorithm first checks if the bytes form valid UTF-8 sequences.
++     * If not, it checks if the bytes form valid GBK sequences.
++     * If neither, it falls back to UTF-8.
++     * </p>
++     *
++     * @param bytes the raw bytes to analyze.
++     * @return the detected charset, never null.
++     */
++    public static Charset detectCharset(final byte[] bytes) {
++        if (bytes == null || bytes.length == 0) {
++            return StandardCharsets.UTF_8;
++        }
++        if (isValidUtf8(bytes)) {
++            return StandardCharsets.UTF_8;
++        }
++        if (GBK != null && isValidGbk(bytes)) {
++            return GBK;
++        }
++        return StandardCharsets.UTF_8;
++    }
++
++    /**
++     * Extracts a ZIP archive to the specified directory with automatic charset
++     * detection for entry names.
++     * <p>
++     * For each entry, the raw name bytes are analyzed to detect the correct charset.
++     * If the detected charset differs from UTF-8, the entry name is re-decoded
++     * using the detected charset before extraction.
++     * </p>
++     *
++     * @param zipStream the input stream containing the ZIP archive.
++     * @param outputDir the directory to extract files to.
++     * @throws IOException if an I/O error occurs or a zip slip attack is detected.
++     */
++    public static void extractWithCharsetDetect(final InputStream zipStream, final Path outputDir) throws IOException {
++        Files.createDirectories(outputDir);
++        final Path normalizedOutputDir = outputDir.toRealPath();
++        try (ZipArchiveInputStream zis = new ZipArchiveInputStream(zipStream)) {
++            ZipArchiveEntry entry;
++            while ((entry = zis.getNextEntry()) != null) {
++                final byte[] rawName = entry.getRawName();
++                if (rawName != null && rawName.length > 0) {
++                    final Charset detected = detectCharset(rawName);
++                    if (!StandardCharsets.UTF_8.equals(detected)) {
++                        final String correctName = new String(rawName, detected);
++                        entry.setName(correctName);
++                    }
++                }
++                final Path outputPath = normalizedOutputDir.resolve(entry.getName()).normalize();
++                if (!outputPath.startsWith(normalizedOutputDir)) {
++                    throw new IOException("Entry is outside of the target directory: " + entry.getName());
++                }
++                if (entry.isDirectory()) {
++                    Files.createDirectories(outputPath);
++                } else {
++                    Files.createDirectories(outputPath.getParent());
++                    try (OutputStream os = Files.newOutputStream(outputPath)) {
++                        IOUtils.copy(zis, os);
++                    }
++                }
++            }
++        }
++    }
++
++    static boolean isValidGbk(final byte[] bytes) {
++        int i = 0;
++        while (i < bytes.length) {
++            final int b = bytes[i] & 0xFF;
++            if (b <= 0x7F) {
++                i++;
++            } else if (b >= 0x81 && b <= 0xFE) {
++                if (i + 1 >= bytes.length) {
++                    return false;
++                }
++                final int b2 = bytes[i + 1] & 0xFF;
++                if (b2 < 0x40 || b2 == 0x7F || b2 > 0xFE) {
++                    return false;
++                }
++                i += 2;
++            } else {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    static boolean isValidUtf8(final byte[] bytes) {
++        int i = 0;
++        while (i < bytes.length) {
++            final int b = bytes[i] & 0xFF;
++            if (b <= 0x7F) {
++                i++;
++            } else if (b >= 0xC2 && b <= 0xDF) {
++                if (i + 1 >= bytes.length || (bytes[i + 1] & 0xC0) != 0x80) {
++                    return false;
++                }
++                i += 2;
++            } else if (b >= 0xE0 && b <= 0xEF) {
++                if (i + 2 >= bytes.length) {
++                    return false;
++                }
++                if ((bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) {
++                    return false;
++                }
++                if (b == 0xE0 && (bytes[i + 1] & 0xE0) == 0x80) {
++                    return false;
++                }
++                if (b == 0xED && (bytes[i + 1] & 0xE0) == 0xA0) {
++                    return false;
++                }
++                i += 3;
++            } else if (b >= 0xF0 && b <= 0xF4) {
++                if (i + 3 >= bytes.length) {
++                    return false;
++                }
++                if ((bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) {
++                    return false;
++                }
++                if (b == 0xF0 && (bytes[i + 1] & 0xF0) == 0x80) {
++                    return false;
++                }
++                if (b == 0xF4 && (bytes[i + 1] & 0xF0) != 0x80) {
++                    return false;
++                }
++                i += 4;
++            } else {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /**
++     * Constructs a new instance.
++     *
++     * @deprecated Will be removed in 2.0.
++     */
++    @Deprecated
++    public ZipCharsetDetectorUtil() {
++    }
++}
+\ No newline at end of file
+diff --git a/src/test/java/org/apache/commons/compress/archivers/zip/ZipCharsetDetectorUtilTest.java b/src/test/java/org/apache/commons/compress/archivers/zip/ZipCharsetDetectorUtilTest.java
+new file mode 100644
+index 000000000..9fc728501
+--- /dev/null
++++ b/src/test/java/org/apache/commons/compress/archivers/zip/ZipCharsetDetectorUtilTest.java
+@@ -0,0 +1,314 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.commons.compress.archivers.zip;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.Charset;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.stream.Collectors;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++class ZipCharsetDetectorUtilTest {
++
++    private static final String CHINESE_FILENAME = "\u4e2d\u6587\u6587\u4ef6\u540d.txt";
++    private static final String CHINESE_DIRNAME = "\u4e2d\u6587\u76ee\u5f55";
++
++    // GBK bytes for "中文文件名.txt"
++    private static byte[] gbkBytes(final String s) {
++        return s.getBytes(Charset.forName("GBK"));
++    }
++
++    @Test
++    void testDetectCharsetNull() {
++        assertEquals(StandardCharsets.UTF_8, ZipCharsetDetectorUtil.detectCharset(null));
++    }
++
++    @Test
++    void testDetectCharsetEmpty() {
++        assertEquals(StandardCharsets.UTF_8, ZipCharsetDetectorUtil.detectCharset(new byte[0]));
++    }
++
++    @Test
++    void testDetectCharsetAsciiOnly() {
++        final byte[] asciiBytes = "hello.txt".getBytes(StandardCharsets.UTF_8);
++        assertEquals(StandardCharsets.UTF_8, ZipCharsetDetectorUtil.detectCharset(asciiBytes));
++    }
++
++    @Test
++    void testDetectCharsetValidUtf8() {
++        final byte[] utf8Bytes = CHINESE_FILENAME.getBytes(StandardCharsets.UTF_8);
++        assertEquals(StandardCharsets.UTF_8, ZipCharsetDetectorUtil.detectCharset(utf8Bytes));
++    }
++
++    @Test
++    void testDetectCharsetGbkBytes() {
++        final byte[] gbkBytes = gbkBytes(CHINESE_FILENAME);
++        final Charset detected = ZipCharsetDetectorUtil.detectCharset(gbkBytes);
++        assertNotNull(detected);
++        assertEquals(CHINESE_FILENAME, new String(gbkBytes, detected));
++    }
++
++    @Test
++    void testDetectCharsetMixedAsciiAndChinese() {
++        final String mixedName = "report_\u62a5\u8868_2024.xlsx";
++        final byte[] gbkBytes = gbkBytes(mixedName);
++        final Charset detected = ZipCharsetDetectorUtil.detectCharset(gbkBytes);
++        assertEquals(mixedName, new String(gbkBytes, detected));
++    }
++
++    @Test
++    void testIsValidUtf8PureAscii() {
++        final byte[] bytes = "HelloWorld123".getBytes(StandardCharsets.UTF_8);
++        assertTrue(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8ChineseUtf8() {
++        final byte[] bytes = CHINESE_FILENAME.getBytes(StandardCharsets.UTF_8);
++        assertTrue(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8GbkBytes() {
++        final byte[] bytes = gbkBytes(CHINESE_FILENAME);
++        assertFalse(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8TruncatedSequence() {
++        final byte[] bytes = new byte[] { (byte) 0xE4, (byte) 0xB8 };
++        assertFalse(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8InvalidContinuation() {
++        final byte[] bytes = new byte[] { (byte) 0xE4, (byte) 0xB8, (byte) 0x20 };
++        assertFalse(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8OverlongEncoding() {
++        final byte[] bytes = new byte[] { (byte) 0xC0, (byte) 0x80 };
++        assertFalse(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8Surrogate() {
++        final byte[] bytes = new byte[] { (byte) 0xED, (byte) 0xA0, (byte) 0x80 };
++        assertFalse(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidUtf8FourByteSequence() {
++        final byte[] bytes = new byte[] { (byte) 0xF0, (byte) 0x90, (byte) 0x80, (byte) 0x80 };
++        assertTrue(ZipCharsetDetectorUtil.isValidUtf8(bytes));
++    }
++
++    @Test
++    void testIsValidGbkPureAscii() {
++        final byte[] bytes = "HelloWorld".getBytes(StandardCharsets.UTF_8);
++        assertTrue(ZipCharsetDetectorUtil.isValidGbk(bytes));
++    }
++
++    @Test
++    void testIsValidGbkChineseBytes() {
++        final byte[] bytes = gbkBytes(CHINESE_FILENAME);
++        assertTrue(ZipCharsetDetectorUtil.isValidGbk(bytes));
++    }
++
++    @Test
++    void testIsValidGbkInvalidSecondByte() {
++        final byte[] bytes = new byte[] { (byte) 0x81, (byte) 0x30 };
++        assertFalse(ZipCharsetDetectorUtil.isValidGbk(bytes));
++    }
++
++    @Test
++    void testIsValidGbkTruncatedSequence() {
++        final byte[] bytes = new byte[] { (byte) 0x81 };
++        assertFalse(ZipCharsetDetectorUtil.isValidGbk(bytes));
++    }
++
++    @Test
++    void testIsValidGbkInvalidFirstByte() {
++        final byte[] bytes = new byte[] { (byte) 0x80, (byte) 0x40 };
++        assertFalse(ZipCharsetDetectorUtil.isValidGbk(bytes));
++    }
++
++    @Test
++    void testIsValidGbkSecondByte0x7F() {
++        final byte[] bytes = new byte[] { (byte) 0x81, (byte) 0x7F };
++        assertFalse(ZipCharsetDetectorUtil.isValidGbk(bytes));
++    }
++
++    @Test
++    void testExtractWithCharsetDetectGbkZip(@TempDir final Path tempDir) throws IOException {
++        final byte[] zipData = createZipWithGbkNames();
++        try (InputStream is = new ByteArrayInputStream(zipData)) {
++            ZipCharsetDetectorUtil.extractWithCharsetDetect(is, tempDir);
++        }
++        final List<String> names = Files.walk(tempDir)
++                .filter(p -> !p.equals(tempDir))
++                .map(p -> tempDir.relativize(p).toString())
++                .sorted()
++                .collect(Collectors.toList());
++        assertTrue(names.contains(CHINESE_FILENAME), "Expected: " + CHINESE_FILENAME + " but got: " + names);
++        assertTrue(names.contains(CHINESE_DIRNAME), "Expected: " + CHINESE_DIRNAME + " but got: " + names);
++        final Path nestedFile = tempDir.resolve(CHINESE_DIRNAME).resolve(CHINESE_FILENAME);
++        assertTrue(Files.exists(nestedFile), "Nested file should exist");
++        assertEquals("content", new String(Files.readAllBytes(tempDir.resolve(CHINESE_FILENAME)), StandardCharsets.UTF_8));
++    }
++
++    @Test
++    void testExtractWithCharsetDetectUtf8Zip(@TempDir final Path tempDir) throws IOException {
++        final byte[] zipData = createZipWithUtf8Names();
++        try (InputStream is = new ByteArrayInputStream(zipData)) {
++            ZipCharsetDetectorUtil.extractWithCharsetDetect(is, tempDir);
++        }
++        final List<String> names = Files.walk(tempDir)
++                .filter(p -> !p.equals(tempDir))
++                .map(p -> tempDir.relativize(p).toString())
++                .sorted()
++                .collect(Collectors.toList());
++        assertTrue(names.contains(CHINESE_FILENAME), "Expected: " + CHINESE_FILENAME + " but got: " + names);
++    }
++
++    @Test
++    void testExtractWithCharsetDetectEmptyZip(@TempDir final Path tempDir) throws IOException {
++        final byte[] emptyZip = createEmptyZip();
++        try (InputStream is = new ByteArrayInputStream(emptyZip)) {
++            ZipCharsetDetectorUtil.extractWithCharsetDetect(is, tempDir);
++        }
++        final List<String> names = Files.walk(tempDir)
++                .filter(p -> !p.equals(tempDir))
++                .collect(Collectors.toList());
++        assertTrue(names.isEmpty());
++    }
++
++    @Test
++    void testExtractWithCharsetDetectZipSlip(@TempDir final Path tempDir) throws IOException {
++        final byte[] zipData = createZipSlipData();
++        try (InputStream is = new ByteArrayInputStream(zipData)) {
++            assertThrows(IOException.class, () -> ZipCharsetDetectorUtil.extractWithCharsetDetect(is, tempDir));
++        }
++    }
++
++    @Test
++    void testExtractWithCharsetDetectDirectory(@TempDir final Path tempDir) throws IOException {
++        final byte[] zipData = createZipWithDirectory();
++        try (InputStream is = new ByteArrayInputStream(zipData)) {
++            ZipCharsetDetectorUtil.extractWithCharsetDetect(is, tempDir);
++        }
++        final Path dir = tempDir.resolve(CHINESE_DIRNAME);
++        assertTrue(Files.isDirectory(dir));
++    }
++
++    @Test
++    void testConstructorDeprecated() {
++        final ZipCharsetDetectorUtil instance = new ZipCharsetDetectorUtil();
++        assertNotNull(instance);
++    }
++
++    private static byte[] createZipWithGbkNames() throws IOException {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(baos)) {
++            zos.setEncoding("GBK");
++            zos.setUseLanguageEncodingFlag(false);
++            zos.setCreateUnicodeExtraFields(ZipArchiveOutputStream.UnicodeExtraFieldPolicy.NEVER);
++
++            ZipArchiveEntry entry = new ZipArchiveEntry(CHINESE_FILENAME);
++            zos.putArchiveEntry(entry);
++            zos.write("content".getBytes(StandardCharsets.UTF_8));
++            zos.closeArchiveEntry();
++
++            entry = new ZipArchiveEntry(CHINESE_DIRNAME + "/");
++            zos.putArchiveEntry(entry);
++            zos.closeArchiveEntry();
++
++            entry = new ZipArchiveEntry(CHINESE_DIRNAME + "/" + CHINESE_FILENAME);
++            zos.putArchiveEntry(entry);
++            zos.write("nested".getBytes(StandardCharsets.UTF_8));
++            zos.closeArchiveEntry();
++        }
++        return baos.toByteArray();
++    }
++
++    private static byte[] createZipWithUtf8Names() throws IOException {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(baos)) {
++            zos.setEncoding(StandardCharsets.UTF_8.name());
++            zos.setUseLanguageEncodingFlag(true);
++
++            final ZipArchiveEntry entry = new ZipArchiveEntry(CHINESE_FILENAME);
++            zos.putArchiveEntry(entry);
++            zos.write("content".getBytes(StandardCharsets.UTF_8));
++            zos.closeArchiveEntry();
++        }
++        return baos.toByteArray();
++    }
++
++    private static byte[] createEmptyZip() throws IOException {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(baos)) {
++            zos.finish();
++        }
++        return baos.toByteArray();
++    }
++
++    private static byte[] createZipSlipData() throws IOException {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(baos)) {
++            zos.setEncoding(StandardCharsets.UTF_8.name());
++
++            final ZipArchiveEntry entry = new ZipArchiveEntry("../evil.txt");
++            zos.putArchiveEntry(entry);
++            zos.write("evil".getBytes(StandardCharsets.UTF_8));
++            zos.closeArchiveEntry();
++        }
++        return baos.toByteArray();
++    }
++
++    private static byte[] createZipWithDirectory() throws IOException {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (ZipArchiveOutputStream zos = new ZipArchiveOutputStream(baos)) {
++            zos.setEncoding("GBK");
++            zos.setUseLanguageEncodingFlag(false);
++            zos.setCreateUnicodeExtraFields(ZipArchiveOutputStream.UnicodeExtraFieldPolicy.NEVER);
++
++            final ZipArchiveEntry entry = new ZipArchiveEntry(CHINESE_DIRNAME + "/");
++            zos.putArchiveEntry(entry);
++            zos.closeArchiveEntry();
++        }
++        return baos.toByteArray();
++    }
++}
+\ No newline at end of file
