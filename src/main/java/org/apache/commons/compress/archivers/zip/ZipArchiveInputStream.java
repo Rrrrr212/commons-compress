@@ -1012,20 +1012,6 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
 
     @Override
     public int read(final byte[] buffer, final int offset, final int length) throws IOException {
-        // 边界：执行所有前置检查
-        final int checkResult = checkReadPreconditions(buffer, offset, length);
-        if (checkResult != 0) {
-            return checkResult;
-        }
-        // 边界：根据压缩方法读取实际数据
-        final int read = readChunk(buffer, offset, length);
-        // 边界：更新 CRC 和计数器（如果成功读取数据）
-        updateCrcAndCount(buffer, offset, read);
-        return read;
-    }
-
-    // NEW METHOD: 执行 read 方法的前置检查
-    private int checkReadPreconditions(final byte[] buffer, final int offset, final int length) throws IOException {
         IOUtils.checkFromIndexSize(buffer, offset, length);
         if (length == 0) {
             return 0;
@@ -1047,34 +1033,27 @@ public class ZipArchiveInputStream extends ArchiveInputStream<ZipArchiveEntry> i
         if (!supportsCompressedSizeFor(current.entry)) {
             throw new UnsupportedZipFeatureException(UnsupportedZipFeatureException.Feature.UNKNOWN_COMPRESSED_SIZE, current.entry);
         }
-        return 0;
-    }
-
-    // NEW METHOD: 根据压缩方法读取数据块
-    private int readChunk(final byte[] buffer, final int offset, final int length) throws IOException {
+        final int read;
         final int method = current.entry.getMethod();
         if (method == ZipArchiveOutputStream.STORED) {
-            return readStored(buffer, offset, length);
+            read = readStored(buffer, offset, length);
         } else if (method == ZipArchiveOutputStream.DEFLATED) {
-            return readDeflated(buffer, offset, length);
+            read = readDeflated(buffer, offset, length);
         } else if (method == ZipMethod.UNSHRINKING.getCode() || method == ZipMethod.IMPLODING.getCode() || method == ZipMethod.ENHANCED_DEFLATED.getCode()
                 || method == ZipMethod.BZIP2.getCode() || ZipMethod.isZstd(method) || method == ZipMethod.XZ.getCode()) {
             try {
-                return current.checkInputStream().read(buffer, offset, length);
+                read = current.checkInputStream().read(buffer, offset, length);
             } catch (final RuntimeException e) {
                 throw new ArchiveException(e);
             }
         } else {
             throw new UnsupportedZipFeatureException(ZipMethod.getMethodByCode(method), current.entry);
         }
-    }
-
-    // NEW METHOD: 更新 CRC 校验和和计数器
-    private void updateCrcAndCount(final byte[] buffer, final int offset, final int read) {
         if (read >= 0) {
             current.crc.update(buffer, offset, read);
             uncompressedCount += read;
         }
+        return read;
     }
 
     private void readDataDescriptor() throws IOException {
