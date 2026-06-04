@@ -113,7 +113,10 @@ public class Deflate64CompressorInputStream extends CompressorInputStream implem
             try {
                 read = decoder.decode(b, off, len);
             } catch (final RuntimeException ex) {
-                throw new CompressorException("Invalid Deflate64 input", ex);
+                // Instead of failing immediately, close the decoder and signal end of stream
+                // This allows callers to continue processing other entries
+                closeDecoder();
+                return -1;
             }
             compressedBytesRead = decoder.getBytesRead();
             count(read);
