@@ -117,27 +117,14 @@ class HuffmanDecoder implements Closeable {
         }
 
         void recordToBuffer(final int distance, final int length, final byte[] buff) {
-            final int safeDistance = Math.min(Math.max(distance, 1), memory.length);
-            int start = wHead - safeDistance & mask;
-            
-            // If we haven't wrapped around yet and start >= wHead, this means we're trying to
-            // go beyond what we've written. In this case, we'll try to read from the beginning
-            // of what we do have.
-            if (!wrappedAround && start >= wHead) {
-                start = 0;
+            if (distance > memory.length) {
+                throw new IllegalStateException("Illegal distance parameter: " + distance);
             }
-            
-            // Copy the data with safety checks
+            final int start = wHead - distance & mask;
+            if (!wrappedAround && start >= wHead) {
+                throw new IllegalStateException("Attempt to read beyond memory: dist=" + distance);
+            }
             for (int i = 0, pos = start; i < length; i++, pos = incCounter(pos)) {
-                // If we haven't wrapped around yet, we can't read beyond what we've written
-                if (!wrappedAround && pos >= wHead) {
-                    // Fill the rest with 0s instead of failing
-                    while (i < length) {
-                        buff[i] = add((byte) 0);
-                        i++;
-                    }
-                    return;
-                }
                 buff[i] = add(memory[pos]);
             }
         }
